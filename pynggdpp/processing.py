@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import collection as ndcCollection
+from pynggdpp import collection as ndcCollection
 
 import argparse
 import sys
