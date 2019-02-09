@@ -9,7 +9,7 @@ import logging
 import requests
 from geojson import Feature, Point, Polygon, FeatureCollection
 from geojson import dumps as geojson_dumps
-from geojson_utils import centroid
+#from geojson_utils import centroid
 from bs4 import BeautifulSoup
 import xmltodict
 from datetime import datetime
