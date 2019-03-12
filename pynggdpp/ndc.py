@@ -2,23 +2,23 @@ from datetime import datetime
 import dateutil.parser as dt_parser
 import os
 import json
+import csv
+import sys
 import hashlib
 from io import BytesIO
-from io import StringIO
 from urllib.parse import urlsplit
 
 import boto3
 
 import requests
-from smart_open import smart_open
 from bs4 import BeautifulSoup
 import xmltodict
-import pandas as pd
 from geojson import Feature, Point, Polygon, FeatureCollection
 from geojson import dumps as geojson_dumps
 from geojson_utils import centroid
 from gis_metadata.metadata_parser import get_metadata_parser
 from gis_metadata.utils import get_supported_props
+from elasticsearch import Elasticsearch
 
 
 # Set variables
@@ -29,6 +29,20 @@ sb_default_format = "json"
 sb_default_props = "title,body,contacts,spatial,files,webLinks,facets,dates"
 ndc_vocab_id = "5bf3f7bce4b00ce5fb627d57"
 ndc_catalog_id = "4f4e4760e4b07f02db47dfb4"
+acceptable_content_types = [
+    'text/plain',
+    'text/plain; charset=ISO-8859-1',
+    'application/xml',
+    'text/csv',
+    'text/plain; charset=windows-1252'
+]
+es_server_config = {
+    "settings": {
+        "number_of_shards": 1,
+        "number_of_replicas": 0
+    }
+}
+
 
 
 class RedirectStdStreams(object):
@@ -88,14 +102,22 @@ def ndc_get_collections(parentId=ndc_catalog_id, fields=sb_default_props):
     return collectionItems
 
 
-def collection_meta(collection_id):
+def get_collection_record(collection_id):
     r = requests.get(f"{sb_catalog_path}?"
                      f"id={collection_id}&"
                      f"format=json&"
                      f"fields={sb_default_props}"
                      ).json()
 
-    collection_record = r["items"][0]
+    if len(r["items"]) == 0:
+        return None
+    else:
+        return r["items"][0]
+
+
+def collection_meta(collection_id=None, collection_record=None):
+    if collection_record is None:
+        collection_record = get_collection_record(collection_id)
 
     collection_meta = dict()
     collection_meta["ndc_collection_id"] = collection_record["id"]
@@ -107,15 +129,55 @@ def collection_meta(collection_id):
                                                            if d["type"] == "dateCreated"), None)
     collection_meta["ndc_collection_queried"] = datetime.utcnow().isoformat()
 
+    improvement_messages = list()
+
+    if "body" in collection_record.keys():
+        collection_meta["ndc_collection_abstract"] = collection_record["body"]
+    else:
+        improvement_messages.append("Need abstract for collection")
+
     if "contacts" in collection_record.keys():
         collection_meta["ndc_collection_owner"] = [c["name"] for c in collection_record["contacts"]
                                if "type" in c.keys() and c["type"] == "Data Owner"]
         if len(collection_meta["ndc_collection_owner"]) == 0:
-            collection_meta["ndc_collection_improvements_needed"] = ["Need data owner contact in collection metadata"]
+            improvement_messages.append("Need data owner contact in collection metadata")
     else:
-        collection_meta["ndc_collection_improvements_needed"] = ["Need contacts in collection metadata"]
+        improvement_messages.append("Need contacts in collection metadata")
+
+    if len(improvement_messages) > 0:
+        collection_meta["ndc_collection_improvements_needed"] = improvement_messages
 
     return collection_meta
+
+
+def build_processable_routes(collection_id=None, collection_record=None):
+    if collection_record is None:
+        collection_record = get_collection_record(collection_id)
+
+    collection_packet = dict()
+    collection_packet["collection_meta"] = collection_meta(collection_record=collection_record)
+
+    if "files" in collection_record.keys():
+        potentially_processable_files = [f for f in collection_record["files"] if f["name"] != "metadata.xml" and
+                              "contentType" in f.keys() and
+                              f["contentType"] in acceptable_content_types]
+        if len(potentially_processable_files) > 0:
+            collection_packet["collection_files"] = potentially_processable_files
+
+    if "webLinks" in collection_record.keys() and \
+            next((l for l in collection_record["webLinks"] if "type" in l.keys() and
+                                                              l["type"] == "WAF"), None) is not None:
+        potentially_processable_weblinks = [l for l in collection_record["webLinks"]
+                                                 if "type" in l.keys() and l["type"] == "WAF"]
+        if len(potentially_processable_weblinks) > 0:
+            collection_packet["collection_links"] = potentially_processable_weblinks
+
+    if "collection_files" in collection_packet.keys() or "collection_links" in collection_packet.keys():
+        collection_packet["process_queue"] = "processable_collections"
+    else:
+        collection_packet["process_queue"] = "dlq_collections"
+
+    return collection_packet
 
 
 def parse_waf(url):
@@ -194,18 +256,19 @@ def introspect_nggdpp_xml(dict_data):
     return introspection_meta
 
 
-def nggdpp_xml_to_recordset(context):
-    s3_object = get_s3_file(context['ndc_s3_file_key'])
+def nggdpp_xml_to_recordset(file_key, context):
+    s3_object = get_s3_file(file_key, bucket_name="ndc-collection-files")
 
-    xml_bytes = BytesIO(s3_object['Body'].read())
-    source_data = xmltodict.parse(xml_bytes.getvalue(), dict_constructor=dict)
+    source_data = xmltodict.parse(s3_object.getvalue(), dict_constructor=dict)
 
     introspection_meta = introspect_nggdpp_xml(source_data)
     xml_tree_top = introspection_meta['ndc_record_container_path'][0]
     xml_tree_next = introspection_meta['ndc_record_container_path'][1]
     recordset = source_data[xml_tree_top][xml_tree_next]
+    recordset = [{k.lower():v for k,v in i.items()} for i in recordset]
 
     for item in recordset:
+        item.update(introspect_coordinates(item))
         for k, v in context.items():
             item.update({k:v})
         for k, v in introspection_meta.items():
@@ -219,47 +282,44 @@ def nggdpp_xml_to_recordset(context):
     return data_package
 
 
-def nggdpp_text_to_recordset(context):
-    with smart_open(f's3://ndc/{context["ndc_s3_file_key"]}', 'r', host=os.environ['AWS_HOST_S3']) as f:
+def nggdpp_text_to_recordset(file_key, content_meta, bucket_name="ndc-collection-files"):
+    csv_lines = get_s3_file(file_key, bucket_name=bucket_name, return_type='lines')
 
-        delimiter = "|"
-        quotechar = ''
-        quoting = csv.QUOTE_NONE
-        first_line = f.readline()
-        for possibility in ["|", ",", "\t"]:
-            if possibility in first_line:
-                delimiter = possibility
-                break
-        if '"' in first_line:
-            quotechar = '"'
-            quoting = csv.QUOTE_MINIMAL
+    if isinstance(csv_lines, str):
+        errors = [csv_lines]
+        s3 = s3_client()
+        bucket_object = s3.get_object(Bucket=bucket_name, Key=file_key)
+        csv_lines = bucket_object['Body'].read().splitlines(True)
+        recordset = list()
+        for line in csv_lines:
+            try:
+                line_content = line.decode('utf-8').rstrip()
+            except UnicodeDecodeError:
+                line_content = line.decode('latin-1').rstrip()
 
-        f.seek(0)
-
-        devnull = StringIO()
-        with RedirectStdStreams(stdout=devnull, stderr=devnull):
-            df_file = pd.read_csv(f,
-                                  sep=delimiter,
-                                  quotechar=quotechar,
-                                  error_bad_lines=False,
-                                  warn_bad_lines=True,
-                                  quoting=quoting)
-        errors = devnull.getvalue()
-
-    if df_file is not None:
-        df_file = df_file.dropna(how="all")
-        df_file.drop(df_file.columns[df_file.columns.str.contains('unnamed', case=False)], axis=1)
-        json_file = df_file.to_json(orient="records")
-        recordset = json.loads(json_file)
-
-        for item in recordset:
-            for k, v in context.items():
-                item.update({k: v})
+            if "dialect" not in locals():
+                dialect = csv.Sniffer().sniff(line_content, ['|', ',', ';', '\t'])
+            line_data = line_content.split(dialect.delimiter)
+            if "headers" not in locals():
+                headers = line_data
+            else:
+                if len(line_data) == len(headers):
+                    record_dict = dict()
+                    for index, item in enumerate(line_data):
+                        record_dict[headers[index]] = item
+                    recordset.append(record_dict)
+                else:
+                    errors.append(str(line_data))
     else:
-        recordset = None
-
-    if len(errors) == 0:
         errors = None
+        reader = csv.DictReader(csv_lines)
+        recordset = json.loads(json.dumps(list(reader)))
+
+    recordset = [{k.lower(): v for k, v in i.items()} for i in recordset]
+    for item in recordset:
+        item.update(introspect_coordinates(item))
+        for k, v in content_meta.items():
+            item.update({k: v})
 
     data_package = {
         "errors": errors,
@@ -267,6 +327,47 @@ def nggdpp_text_to_recordset(context):
     }
 
     return data_package
+
+
+def introspect_coordinates(item):
+    item["ndc_processing_errors"] = list()
+    item["ndc_processing_errors_number"] = 0
+
+    if "coordinates" not in item.keys():
+        if ("latitude" in item.keys() and "longitude" in item.keys()):
+            item["coordinates"] = f'{item["longitude"]},{item["latitude"]}'
+
+    if "coordinates" in item.keys() and item["coordinates"] is not None:
+        try:
+            if "," in item["coordinates"]:
+                try:
+                    item["ndc_location"] = \
+                        Point((float(item["coordinates"].split(',')[0]), float(item["coordinates"].split(',')[1])))
+                    item["ndc_geopoint"] = {
+                        "lon": float(item["coordinates"].split(',')[0]),
+                        "lat": float(item["coordinates"].split(',')[1])
+                    }
+                except:
+                    pass
+        except Exception as e:
+            item["ndc_processing_errors"].append(
+                {
+                    "error": e,
+                    "info": f"{str(item['coordinates'])}; kept empty geometry"
+                }
+            )
+            item["ndc_processing_errors_number"]+=1
+    else:
+        item["ndc_processing_errors"].append(
+            {
+                "error": "Null Coordinates",
+                "info": "Count not determine location from data"
+            }
+        )
+        item["ndc_processing_errors_number"] += 1
+
+    return item
+
 
 
 def build_ndc_metadata(context):
@@ -313,7 +414,7 @@ def nggdpp_recordset_to_feature_collection(recordset):
                         "info": f"{str(p['coordinates'])}; kept empty geometry"
                     }
                 )
-                p["ndc_processing_errors"]+=1
+                p["ndc_processing_errors_number"]+=1
 
         feature_list.append(Feature(geometry=g, properties=p))
 
@@ -321,7 +422,7 @@ def nggdpp_recordset_to_feature_collection(recordset):
 
 
 def feature_from_metadata(collection_meta, link_meta):
-    meta_doc = get_s3_file(link_meta["aws_s3_key"]).getvalue()
+    meta_doc = get_s3_file(link_meta["key_name"]).getvalue()
 
     # Create structure for properties starting with infused collection metadata
     p = collection_meta
@@ -356,14 +457,9 @@ def feature_from_metadata(collection_meta, link_meta):
         p['coordinates_geojson'] = [[west, north], [east, north], [east, south], [west, south]]
         p['coordinates_wkt'] = [[(west, north), (east, north), (east, south), (west, south), (west, north)]]
 
-        # Determine the best way to provide point coordinates and record the method
-        if east == west and south == north:
-            p['coordinates_point']['coordinates'] = f"{east},{south}"
-            p['coordinates_point']['method'] = "bbox corner"
-        else:
-            c = centroid(Polygon(p['coordinates_wkt']))['coordinates']
-            p['coordinates_point']['coordinates'] = f"{c[0]},{c[1]}"
-            p['coordinates_point']['method'] = "bbox centroid"
+        p['coordinates_point']['coordinates'] = f"{east},{south}"
+        p['coordinates_point']['method'] = "bbox corner"
+        p['ndc_geopoint'] = f"{east},{south}"
     else:
         p['coordinates_point']['coordinates'] = None
         p['coordinates_point']['method'] = "no processable geometry"
@@ -380,51 +476,57 @@ def feature_from_metadata(collection_meta, link_meta):
     return f
 
 
+def s3_client():
+    return boto3.client('s3', endpoint_url=os.environ['AWS_HOST_S3'])
+
+
 def url_to_s3_key(url):
     parsed_url = urlsplit(url)
     return f"{parsed_url.netloc}{parsed_url.path}"
 
 
-def s3_json_to_dict(aws_key, bucket_name='ndc'):
-    try:
-        with smart_open(f's3://{bucket_name}/{aws_key}', 'r', host=os.environ['AWS_HOST_S3']) as f:
-            data_package = json.loads(f.read())
+def get_s3_file(key, bucket_name='ndc-collection-files', return_type='bytes'):
+    s3 = s3_client()
+    bucket_object = s3.get_object(Bucket=bucket_name, Key=key)
 
-        return data_package
-
-    except:
-        return None
-
-
-def get_s3_file(key, bucket_name='ndc'):
-    s3_client = boto3.client('s3', endpoint_url=os.environ['AWS_HOST_S3'])
-    bucket_object = s3_client.get_object(Bucket=bucket_name, Key=key)
-    file_bytes = BytesIO(bucket_object['Body'].read())
-
-    return file_bytes
+    if return_type == "raw":
+        return bucket_object
+    elif return_type == "bytes":
+        return BytesIO(bucket_object['Body'].read())
+    elif return_type == "dict":
+        return json.loads(BytesIO(bucket_object['Body'].read()).read())
+    elif return_type == "lines":
+        try:
+            return bucket_object['Body'].read().decode('utf-8').splitlines(True)
+        except UnicodeDecodeError:
+            return "File encoding problem encountered"
 
 
-def remove_s3_object(key, bucket_name='ndc'):
+def remove_s3_object(key, bucket_name='ndc-collection-files'):
     s3_resource = boto3.resource('s3', endpoint_url=os.environ['AWS_HOST_S3'])
     response = s3_resource.Object(bucket_name, key).delete()
 
     return response
 
 
-def transfer_file_to_s3(source_url, key_name=None):
+def transfer_file_to_s3(source_url, bucket_name="ndc-collection-files", key_name=None):
     s3 = boto3.resource('s3',
                         endpoint_url=os.environ['AWS_HOST_S3'])
 
     if key_name is None:
         key_name = url_to_s3_key(source_url)
 
-    bucket_object = s3.Object('ndc', key_name)
+    bucket_object = s3.Object(bucket_name, key_name)
 
     file_object = requests.get(source_url).content
 
     bucket_response = bucket_object.put(Body=file_object)
 
-    return bucket_response
+    return {
+        "key_name": key_name,
+        "source_url": source_url,
+        "bucket_response": bucket_response
+    }
 
 
 def put_file_to_s3(source_data, key_name, bucket_name='ndc'):
@@ -436,6 +538,18 @@ def put_file_to_s3(source_data, key_name, bucket_name='ndc'):
     bucket_response = bucket_object.put(Body=json.dumps(source_data))
 
     return bucket_response
+
+
+def check_s3_file(key_name, bucket_name):
+    s3 = boto3.resource('s3',
+                        endpoint_url=os.environ["AWS_HOST_S3"])
+
+    try:
+        s3.Object(bucket_name, key_name).load()
+    except:
+        return False
+    else:
+        return True
 
 
 def q_url(QueueName):
@@ -560,4 +674,51 @@ def build_ndc_feature(geom, props):
 
 def build_ndc_feature_collection(feature_list):
     return FeatureCollection(feature_list)
+
+
+def elastic_client():
+    return Elasticsearch(hosts=[os.environ["AWS_HOST_Elasticsearch"]])
+
+
+def create_es_index(index_name):
+    responses = list()
+    es = elastic_client()
+    body = es_server_config
+    if es.indices.exists(index_name):
+        responses.append(es.indices.delete(index=index_name))
+    responses.append(es.indices.create(index=index_name, body=body))
+    return responses
+
+
+def bulk_build_es_index(index_name, bulk_data):
+    es = elastic_client()
+    if not es.indices.exists(index_name):
+        create_es_index(index_name)
+    r = es.bulk(index=index_name, body=bulk_data, refresh=True)
+    return r
+
+
+def index_record_list(index_name, record_list):
+    es = elastic_client()
+    if not es.indices.exists(index_name):
+        create_es_index(index_name)
+    for record in record_list:
+        es.index(index=index_name, doc_type='ndc_collection_item', body=record)
+    return len(record_list)
+
+
+def map_index(index_name):
+    es = elastic_client()
+    mapping = {
+        "ndc_collection_item": {
+            "properties": {
+                "ndc_geopoint": {
+                    "type": "geo_point"
+                }
+            }
+        }
+    }
+    r = es.indices.put_mapping(index=index_name, body=mapping, doc_type="ndc_collection_item")
+    return r
+
 
