@@ -7,7 +7,7 @@ defusedxml==0.5.0
 geojson==2.4.1
 gis-metadata-parser==1.1.4
 idna==2.8
-numpy==1.16.1
+numpy==1.22.0
 pandas==0.24.1
 parserutils==1.1.2
 python-dateutil==2.8.0
